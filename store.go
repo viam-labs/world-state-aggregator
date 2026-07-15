@@ -31,16 +31,24 @@ func (s *store) get(uuid string) *commonpb.Transform {
 	return s.transforms[uuid]
 }
 
-func (s *store) set(uuid string, t *commonpb.Transform) {
+func (s *store) set(uuid string, t *commonpb.Transform) (existed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	_, existed = s.transforms[uuid]
 	s.transforms[uuid] = t
+	return existed
 }
 
-func (s *store) remove(uuid string) {
+// remove deletes uuid and returns the previous value, or nil if it wasn't set.
+func (s *store) remove(uuid string) *commonpb.Transform {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	prev, ok := s.transforms[uuid]
+	if !ok {
+		return nil
+	}
 	delete(s.transforms, uuid)
+	return prev
 }
 
 func (s *store) snapshot() []*commonpb.Transform {

@@ -3,16 +3,46 @@ package wsaggregator
 import (
 	"context"
 	"testing"
+	"time"
 
+	pb "go.viam.com/api/service/worldstatestore/v1"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/services/worldstatestore"
 	"go.viam.com/test"
 )
 
 func newAggregatorForTest() *aggregator {
+	return newAggregatorForTestWithBuffer(defaultSubscriberBufferSize)
+}
+
+func newAggregatorForTestWithBuffer(buf int) *aggregator {
 	return &aggregator{
-		logger: logging.NewTestLogger(&testing.T{}),
-		store:  newStore(),
+		logger:      logging.NewTestLogger(&testing.T{}),
+		store:       newStore(),
+		subscribers: make(map[uint64]*subscriber),
+		bufferSize:  buf,
+	}
+}
+
+func recvWithin(t *testing.T, ch <-chan worldstatestore.TransformChange, d time.Duration) worldstatestore.TransformChange {
+	t.Helper()
+	select {
+	case ev := <-ch:
+		return ev
+	case <-time.After(d):
+		t.Fatal("timeout waiting for change event")
+		return worldstatestore.TransformChange{}
+	}
+}
+
+func expectNoRecv(t *testing.T, ch <-chan worldstatestore.TransformChange, d time.Duration) {
+	t.Helper()
+	select {
+	case ev, ok := <-ch:
+		if ok {
+			t.Fatalf("unexpected change event: %+v", ev)
+		}
+	case <-time.After(d):
 	}
 }
 
@@ -152,4 +182,129 @@ func TestRemoveTransformValidation(t *testing.T) {
 			test.That(t, err.Error(), test.ShouldContainSubstring, tc.wantMsg)
 		})
 	}
+}
+
+func TestNoReplayOnSubscribe(t *testing.T) {
+	a := newAggregatorForTest()
+	setTransform(t, a, "existing", "f")
+
+	sub := a.register()
+	defer a.unregister(sub)
+
+	expectNoRecv(t, sub.ch, 50*time.Millisecond)
+}
+
+func TestSubscriberReceivesAddedUpdatedRemoved(t *testing.T) {
+	a := newAggregatorForTest()
+	sub := a.register()
+	defer a.unregister(sub)
+
+	setTransform(t, a, "u1", "f-a")
+	added := recvWithin(t, sub.ch, 200*time.Millisecond)
+	test.That(t, added.ChangeType, test.ShouldEqual, pb.TransformChangeType_TRANSFORM_CHANGE_TYPE_ADDED)
+	test.That(t, added.Transform.ReferenceFrame, test.ShouldEqual, "f-a")
+	test.That(t, string(added.Transform.Uuid), test.ShouldEqual, "u1")
+
+	setTransform(t, a, "u1", "f-b")
+	updated := recvWithin(t, sub.ch, 200*time.Millisecond)
+	test.That(t, updated.ChangeType, test.ShouldEqual, pb.TransformChangeType_TRANSFORM_CHANGE_TYPE_UPDATED)
+	test.That(t, updated.Transform.ReferenceFrame, test.ShouldEqual, "f-b")
+
+	_, err := a.DoCommand(context.Background(), map[string]interface{}{
+		"remove_transform": map[string]interface{}{"uuid": "u1"},
+	})
+	test.That(t, err, test.ShouldBeNil)
+	removed := recvWithin(t, sub.ch, 200*time.Millisecond)
+	test.That(t, removed.ChangeType, test.ShouldEqual, pb.TransformChangeType_TRANSFORM_CHANGE_TYPE_REMOVED)
+	test.That(t, string(removed.Transform.Uuid), test.ShouldEqual, "u1")
+}
+
+func TestRemoveUnknownDoesNotPublish(t *testing.T) {
+	a := newAggregatorForTest()
+	sub := a.register()
+	defer a.unregister(sub)
+
+	_, err := a.DoCommand(context.Background(), map[string]interface{}{
+		"remove_transform": map[string]interface{}{"uuid": "nope"},
+	})
+	test.That(t, err, test.ShouldBeNil)
+	expectNoRecv(t, sub.ch, 50*time.Millisecond)
+}
+
+func TestMultipleSubscribersEachReceive(t *testing.T) {
+	a := newAggregatorForTest()
+	s1 := a.register()
+	defer a.unregister(s1)
+	s2 := a.register()
+	defer a.unregister(s2)
+
+	setTransform(t, a, "u1", "f")
+	e1 := recvWithin(t, s1.ch, 200*time.Millisecond)
+	e2 := recvWithin(t, s2.ch, 200*time.Millisecond)
+	test.That(t, e1.ChangeType, test.ShouldEqual, pb.TransformChangeType_TRANSFORM_CHANGE_TYPE_ADDED)
+	test.That(t, e2.ChangeType, test.ShouldEqual, pb.TransformChangeType_TRANSFORM_CHANGE_TYPE_ADDED)
+}
+
+func TestSlowSubscriberDropsWithoutBlockingOthers(t *testing.T) {
+	a := newAggregatorForTestWithBuffer(2)
+	slow := a.register()
+	defer a.unregister(slow)
+	fast := a.register()
+	defer a.unregister(fast)
+
+	// Drain fast concurrently so its buffer never fills.
+	const N = 50
+	done := make(chan struct{})
+	got := 0
+	go func() {
+		defer close(done)
+		for got < N {
+			select {
+			case <-fast.ch:
+				got++
+			case <-time.After(2 * time.Second):
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < N; i++ {
+		setTransform(t, a, "u1", "f")
+	}
+	<-done
+
+	test.That(t, got, test.ShouldEqual, N)
+	// Slow's buffer is 2, so it received at most 2 of N.
+	slowGot := len(slow.ch)
+	test.That(t, slowGot, test.ShouldBeLessThanOrEqualTo, 2)
+}
+
+func TestCtxCancelUnregisters(t *testing.T) {
+	a := newAggregatorForTest()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	stream, err := a.StreamTransformChanges(ctx, nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, stream, test.ShouldNotBeNil)
+
+	// One subscriber registered.
+	a.subMu.Lock()
+	count := len(a.subscribers)
+	a.subMu.Unlock()
+	test.That(t, count, test.ShouldEqual, 1)
+
+	cancel()
+
+	// Give the ctx-watcher goroutine a moment to unregister.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		a.subMu.Lock()
+		count = len(a.subscribers)
+		a.subMu.Unlock()
+		if count == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	test.That(t, count, test.ShouldEqual, 0)
 }
