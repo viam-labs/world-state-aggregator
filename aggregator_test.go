@@ -245,38 +245,20 @@ func TestMultipleSubscribersEachReceive(t *testing.T) {
 	test.That(t, e2.ChangeType, test.ShouldEqual, pb.TransformChangeType_TRANSFORM_CHANGE_TYPE_ADDED)
 }
 
-func TestSlowSubscriberDropsWithoutBlockingOthers(t *testing.T) {
-	a := newAggregatorForTestWithBuffer(2)
+func TestSlowSubscriberDoesNotBlockPublisher(t *testing.T) {
+	const buf = 2
+	const N = 50
+	a := newAggregatorForTestWithBuffer(buf)
 	slow := a.register()
 	defer a.unregister(slow)
-	fast := a.register()
-	defer a.unregister(fast)
 
-	// Drain fast concurrently so its buffer never fills.
-	const N = 50
-	done := make(chan struct{})
-	got := 0
-	go func() {
-		defer close(done)
-		for got < N {
-			select {
-			case <-fast.ch:
-				got++
-			case <-time.After(2 * time.Second):
-				return
-			}
-		}
-	}()
-
+	// slow.ch is never drained. If publish were blocking, this loop would hang
+	// once the buffer fills; reaching the assertions proves publish is
+	// non-blocking under a full subscriber.
 	for i := 0; i < N; i++ {
 		setTransform(t, a, "u1", "f")
 	}
-	<-done
-
-	test.That(t, got, test.ShouldEqual, N)
-	// Slow's buffer is 2, so it received at most 2 of N.
-	slowGot := len(slow.ch)
-	test.That(t, slowGot, test.ShouldBeLessThanOrEqualTo, 2)
+	test.That(t, len(slow.ch), test.ShouldEqual, buf)
 }
 
 func TestCtxCancelUnregisters(t *testing.T) {

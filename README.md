@@ -30,16 +30,10 @@ Standard `rdk:service:world_state_store` methods:
 
 ### Write API (DoCommand)
 
-> **Status:** stub — not implemented yet. Will land in a follow-up PR.
-
 | Command | Args | Effect |
 |---|---|---|
 | `set_transform` | `{uuid, reference_frame, pose_in_observer_frame, physical_object?, metadata?}` | Upsert. Emits `ADDED` if new, `UPDATED` if existing. |
-| `remove_transform` | `{uuid}` | Delete. Emits `REMOVED`. Unknown UUID is a silent no-op. |
+| `remove_transform` | `{uuid}` | Delete. Emits `REMOVED` if the UUID existed. Unknown UUID is a silent no-op (no event). |
 | `list_transforms` | `{}` | Snapshot of all transforms. For CLI debug. |
 
 UUIDs are operator-namespaced strings on the wire (e.g. `tool-changer-1/attached`), stored as bytes internally.
-
-## Status
-
-Under construction. PR #1 lands the module scaffold with a stub Service. Storage and write API in follow-up PRs.
