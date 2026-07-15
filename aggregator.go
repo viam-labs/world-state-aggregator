@@ -5,14 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	commonpb "go.viam.com/api/common/v1"
+	pb "go.viam.com/api/service/worldstatestore/v1"
 
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/worldstatestore"
 	"google.golang.org/protobuf/encoding/protojson"
 )
+
+const defaultSubscriberBufferSize = 64
 
 func init() {
 	resource.RegisterService(
@@ -30,10 +34,20 @@ func newAggregator(
 	conf resource.Config,
 	logger logging.Logger,
 ) (worldstatestore.Service, error) {
+	cfg, err := resource.NativeConfig[*Config](conf)
+	if err != nil {
+		return nil, err
+	}
+	bufSize := cfg.SubscriberBufferSize
+	if bufSize <= 0 {
+		bufSize = defaultSubscriberBufferSize
+	}
 	return &aggregator{
-		Named:  conf.ResourceName().AsNamed(),
-		logger: logger,
-		store:  newStore(),
+		Named:       conf.ResourceName().AsNamed(),
+		logger:      logger,
+		store:       newStore(),
+		subscribers: make(map[uint64]*subscriber),
+		bufferSize:  bufSize,
 	}, nil
 }
 
@@ -44,6 +58,16 @@ type aggregator struct {
 
 	logger logging.Logger
 	store  *store
+
+	subMu       sync.Mutex
+	subscribers map[uint64]*subscriber
+	nextSubID   uint64
+	bufferSize  int
+}
+
+type subscriber struct {
+	id uint64
+	ch chan worldstatestore.TransformChange
 }
 
 func (a *aggregator) ListUUIDs(ctx context.Context, extra map[string]any) ([][]byte, error) {
@@ -58,9 +82,52 @@ func (a *aggregator) GetTransform(ctx context.Context, uuid []byte, extra map[st
 }
 
 func (a *aggregator) StreamTransformChanges(ctx context.Context, extra map[string]any) (*worldstatestore.TransformChangeStream, error) {
-	ch := make(chan worldstatestore.TransformChange)
-	close(ch)
-	return worldstatestore.NewTransformChangeStreamFromChannel(ctx, ch), nil
+	sub := a.register()
+	go func() {
+		<-ctx.Done()
+		a.unregister(sub)
+	}()
+	return worldstatestore.NewTransformChangeStreamFromChannel(ctx, sub.ch), nil
+}
+
+func (a *aggregator) register() *subscriber {
+	a.subMu.Lock()
+	defer a.subMu.Unlock()
+	a.nextSubID++
+	s := &subscriber{
+		id: a.nextSubID,
+		ch: make(chan worldstatestore.TransformChange, a.bufferSize),
+	}
+	a.subscribers[s.id] = s
+	return s
+}
+
+func (a *aggregator) unregister(s *subscriber) {
+	a.subMu.Lock()
+	defer a.subMu.Unlock()
+	if _, ok := a.subscribers[s.id]; !ok {
+		return
+	}
+	delete(a.subscribers, s.id)
+	close(s.ch)
+}
+
+// publish sends change to every live subscriber. Non-blocking per subscriber:
+// a full buffer drops the event for that subscriber only.
+func (a *aggregator) publish(change worldstatestore.TransformChange) {
+	a.subMu.Lock()
+	defer a.subMu.Unlock()
+	for _, s := range a.subscribers {
+		select {
+		case s.ch <- change:
+		default:
+			a.logger.Warnw("dropped change for subscriber; buffer full",
+				"subscriber_id", s.id,
+				"uuid", string(change.Transform.Uuid),
+				"change_type", change.ChangeType.String(),
+			)
+		}
+	}
 }
 
 func (a *aggregator) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
@@ -90,7 +157,14 @@ func (a *aggregator) doSetTransform(v interface{}) (map[string]interface{}, erro
 		return nil, fmt.Errorf("set_transform: %w", err)
 	}
 	t.Uuid = []byte(uuid)
-	a.store.set(uuid, t)
+	existed := a.store.set(uuid, t)
+
+	changeType := pb.TransformChangeType_TRANSFORM_CHANGE_TYPE_ADDED
+	if existed {
+		changeType = pb.TransformChangeType_TRANSFORM_CHANGE_TYPE_UPDATED
+	}
+	a.publish(worldstatestore.TransformChange{ChangeType: changeType, Transform: t})
+
 	return map[string]interface{}{"success": true, "uuid": uuid}, nil
 }
 
@@ -103,7 +177,12 @@ func (a *aggregator) doRemoveTransform(v interface{}) (map[string]interface{}, e
 	if err != nil {
 		return nil, err
 	}
-	a.store.remove(uuid)
+	if prev := a.store.remove(uuid); prev != nil {
+		a.publish(worldstatestore.TransformChange{
+			ChangeType: pb.TransformChangeType_TRANSFORM_CHANGE_TYPE_REMOVED,
+			Transform:  prev,
+		})
+	}
 	return map[string]interface{}{"success": true, "uuid": uuid}, nil
 }
 
